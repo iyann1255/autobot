@@ -198,9 +198,35 @@ def format_testimoni_card(barang: str, harga_rp: str, kontak: str) -> str:
 # =========================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
+    admin = is_admin(u.id)
+
+    text = (
+        "📦 *AUTO ORDER BOT*\n\n"
+        "🛒 *Cara Order*\n"
+        "1) Buka Katalog\n"
+        "2) Pilih produk\n"
+        "3) Bayar (DANA / BANK / QRIS)\n"
+        "4) Kirim bukti\n"
+        "5) Selesai\n\n"
+        "👤 *USER CMD*\n"
+        "/start - buka menu\n"
+        "/confirm <id> - konfirmasi order\n"
+        "/testi <id> - kirim testimoni\n"
+    )
+
+    if admin:
+        text += (
+            "\n👑 *ADMIN CMD*\n"
+            "/addprod - tambah produk (list)\n"
+            "/setprod - edit produk\n"
+            "/delprod - hapus produk\n"
+            "/setqris - ambil QRIS_FILE_ID\n"
+        )
+
     await update.message.reply_text(
-        "Auto Order aktif.\nPilih produk, bayar manual (DANA/Bank/QRIS), kirim bukti. Beres.",
-        reply_markup=kb_main(is_admin(u.id)),
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb_main(admin),
     )
 
 # Bulk /addprod list mode (ADMIN ONLY)
@@ -397,6 +423,26 @@ async def testi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
     )
 
+# /confirm <order_id> command
+async def confirm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not context.args:
+        return await update.message.reply_text("Format: /confirm <order_id>  (contoh: /confirm 12)")
+
+    raw = context.args[0].strip()
+    raw = raw[1:] if raw.startswith("#") else raw
+    if not raw.isdigit():
+        return await update.message.reply_text("Order ID harus angka. Contoh: /confirm 12")
+
+    oid = int(raw)
+    with db() as conn:
+        row = conn.execute("SELECT id FROM orders WHERE id=? AND user_id=?", (oid, u.id)).fetchone()
+    if not row:
+        return await update.message.reply_text("Order tidak ditemukan (atau bukan punyamu).")
+
+    context.user_data["await_proof_order_id"] = oid
+    await update.message.reply_text(f"OK. Kirim foto bukti untuk order #{oid} sekarang.")
+
 # =========================
 # CALLBACKS
 # =========================
@@ -565,23 +611,10 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MESSAGE HANDLERS
 # =========================
 async def msg_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Only used for order creation after selecting product
     u = update.effective_user
     text = (update.message.text or "").strip()
 
-    # /confirm 12 -> bind next photo to order
-    if text.lower().startswith("/confirm"):
-        parts = text.split()
-        if len(parts) < 2 or not parts[1].lstrip("#").isdigit():
-            return await update.message.reply_text("Format: /confirm <order_id>  (contoh: /confirm 12)")
-        oid = int(parts[1].lstrip("#"))
-        with db() as conn:
-            row = conn.execute("SELECT id FROM orders WHERE id=? AND user_id=?", (oid, u.id)).fetchone()
-        if not row:
-            return await update.message.reply_text("Order tidak ditemukan (atau bukan punyamu).")
-        context.user_data["await_proof_order_id"] = oid
-        return await update.message.reply_text(f"OK. Kirim foto bukti untuk order #{oid} sekarang.")
-
-    # Create order after selecting product
     if "pending_pid" in context.user_data:
         if text.lower() == "cancel":
             context.user_data.pop("pending_pid", None)
@@ -643,7 +676,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not order_id:
         return await update.message.reply_text(
             "Aku butuh order_id biar bukti gak nyasar.\n"
-            "Kirim ulang fotonya pakai caption `#<order_id>` (contoh: `#12`), atau ketik `/confirm 12` dulu."
+            "Kirim ulang fotonya pakai caption `#<order_id>` (contoh: `#12`), atau pakai `/confirm <id>` dulu."
         )
 
     with db() as conn:
@@ -705,6 +738,7 @@ def main():
     app.add_handler(CommandHandler("delprod", delprod_cmd))
     app.add_handler(CommandHandler("setqris", setqris_cmd))
     app.add_handler(CommandHandler("testi", testi_cmd))
+    app.add_handler(CommandHandler("confirm", confirm_cmd))
 
     # callbacks + messages
     app.add_handler(CallbackQueryHandler(cb_handler))
