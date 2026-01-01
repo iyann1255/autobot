@@ -39,6 +39,9 @@ for x in os.getenv("ADMIN_IDS", "").split(","):
     if x.isdigit():
         ADMIN_IDS.add(int(x))
 
+# Biaya admin per order (flat)
+ADMIN_FEE = int(os.getenv("ADMIN_FEE", "200"))
+
 # Manual payment info
 DANA_NUMBER = os.getenv("DANA_NUMBER", "").strip()
 DANA_NAME = os.getenv("DANA_NAME", "").strip()
@@ -54,6 +57,9 @@ QRIS_LOCAL_PATH = os.getenv("QRIS_LOCAL_PATH", "qris.jpg").strip()
 # Testimoni channel
 TESTI_CHANNEL_ID = os.getenv("TESTI_CHANNEL_ID", "").strip()  # @username or -100xxxx
 TESTI_CONTACT = os.getenv("TESTI_CONTACT", "@Jdiginibebot").strip()
+
+# Pagination
+PAGE_SIZE = int(os.getenv("PAGE_SIZE", "6"))
 
 # =========================
 # DB
@@ -115,10 +121,28 @@ def kb_main(admin: bool) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton("🧾 Admin: Order", callback_data="adm_orders")])
     return InlineKeyboardMarkup(rows)
 
-def kb_products(items: List[sqlite3.Row]) -> InlineKeyboardMarkup:
+def kb_products_paged(items: List[sqlite3.Row], page: int) -> InlineKeyboardMarkup:
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
+    page_items = items[start:end]
+
     rows = []
-    for p in items[:30]:
-        rows.append([InlineKeyboardButton(f"{p['name']} • {rupiah(p['price'])}", callback_data=f"buy_{p['id']}")])
+    for p in page_items:
+        rows.append([
+            InlineKeyboardButton(
+                f"{p['name']} • {rupiah(p['price'])}",
+                callback_data=f"buy_{p['id']}"
+            )
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⏮ Sebelumnya", callback_data=f"cat_{page-1}"))
+    if end < len(items):
+        nav.append(InlineKeyboardButton("⏭ Selanjutnya", callback_data=f"cat_{page+1}"))
+    if nav:
+        rows.append(nav)
+
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="home")])
     return InlineKeyboardMarkup(rows)
 
@@ -136,15 +160,31 @@ def kb_admin_order_actions(order_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("❌ Reject", callback_data=f"adm_rej_{order_id}"),
     ]])
 
+def kb_qty() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1️⃣", callback_data="qty_1"),
+            InlineKeyboardButton("2️⃣", callback_data="qty_2"),
+            InlineKeyboardButton("3️⃣", callback_data="qty_3"),
+        ],
+        [InlineKeyboardButton("⬅️ Back", callback_data="cat")]
+    ])
+
 # =========================
 # HELPERS
 # =========================
 def payment_instructions(amount: int, order_id: int) -> str:
     return "\n".join([
-        "Silakan bayar sesuai metode yang kamu pilih:",
+        "Silakan lakukan pembayaran:",
         "",
-        f"Total: *{rupiah(amount)}*",
+        f"💰 *Total Bayar: {rupiah(amount)}*",
+        f"🧾 (Termasuk biaya admin {rupiah(ADMIN_FEE)})",
         f"Order ID: `#{order_id}`",
+        "",
+        "Metode:",
+        "• DANA",
+        "• Transfer Bank",
+        "• QRIS",
         "",
         "1) *DANA*",
         f"• No: `{DANA_NUMBER or '-'}'",
@@ -205,9 +245,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🛒 *Cara Order*\n"
         "1) Buka Katalog\n"
         "2) Pilih produk\n"
-        "3) Bayar (DANA / BANK / QRIS)\n"
-        "4) Kirim bukti\n"
-        "5) Selesai\n\n"
+        "3) Pilih jumlah (1/2/3)\n"
+        "4) Bayar (DANA / BANK / QRIS)\n"
+        "5) Kirim bukti\n\n"
+        f"🧾 Biaya admin per order: *{rupiah(ADMIN_FEE)}*\n\n"
         "👤 *USER CMD*\n"
         "/start - buka menu\n"
         "/confirm <id> - konfirmasi order\n"
@@ -230,10 +271,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # Bulk /addprod list mode (ADMIN ONLY)
-# Usage:
-# /addprod
-# Nama | harga | catatan(optional)
-# Nama | harga
 async def addprod_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not is_admin(u.id):
@@ -294,7 +331,6 @@ async def addprod_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(msg), parse_mode=ParseMode.MARKDOWN)
 
-# /setprod ID | Nama | harga | active=1/0(optional) | catatan(optional)
 async def setprod_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not is_admin(u.id):
@@ -305,9 +341,7 @@ async def setprod_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 3:
         return await update.message.reply_text(
             "Format:\n"
-            "/setprod ID | Nama | harga | active=1/0(optional) | catatan(optional)\n\n"
-            "Contoh:\n"
-            "/setprod 1 | UBOT 1 BULAN | 20000 | active=1 | garansi 7 hari"
+            "/setprod ID | Nama | harga | active=1/0(optional) | catatan(optional)"
         )
 
     if not parts[0].isdigit():
@@ -345,7 +379,6 @@ async def setprod_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"OK. Produk #{pid} diupdate.")
 
-# /delprod ID
 async def delprod_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not is_admin(u.id):
@@ -360,7 +393,6 @@ async def delprod_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.execute("DELETE FROM products WHERE id=?", (pid,))
     await update.message.reply_text(f"OK. Produk #{pid} dihapus.")
 
-# Reply to QRIS photo then /setqris to get file_id
 async def setqris_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not is_admin(u.id):
@@ -373,7 +405,6 @@ async def setqris_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
     )
 
-# /testi <order_id>  -> auto post to testi channel (from order)
 async def testi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
 
@@ -381,7 +412,7 @@ async def testi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("TESTI_CHANNEL_ID belum diset di .env, atau bot belum admin channel.")
 
     if not context.args:
-        return await update.message.reply_text("Format: /testi <order_id>  (contoh: /testi 12)")
+        return await update.message.reply_text("Format: /testi <order_id> (contoh: /testi 12)")
 
     raw = context.args[0].strip()
     raw = raw[1:] if raw.startswith("#") else raw
@@ -423,7 +454,6 @@ async def testi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
     )
 
-# /confirm <order_id> command
 async def confirm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not context.args:
@@ -455,13 +485,30 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "home":
         return await q.edit_message_text("Menu:", reply_markup=kb_main(is_admin(u.id)))
 
+    # Katalog page 0
     if data == "cat":
         with db() as conn:
-            items = conn.execute("SELECT * FROM products WHERE active=1 ORDER BY id DESC").fetchall()
+            items = conn.execute("SELECT * FROM products WHERE active=1 ORDER BY id ASC").fetchall()
         if not items:
             return await q.edit_message_text("Belum ada produk aktif.", reply_markup=kb_main(is_admin(u.id)))
-        return await q.edit_message_text("Katalog (klik untuk order):", reply_markup=kb_products(items))
+        return await q.edit_message_text(
+            "🛒 *Katalog Produk*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb_products_paged(items, page=0),
+        )
 
+    # Katalog pagination
+    if data.startswith("cat_"):
+        page = int(data.split("_")[1])
+        with db() as conn:
+            items = conn.execute("SELECT * FROM products WHERE active=1 ORDER BY id ASC").fetchall()
+        return await q.edit_message_text(
+            "🛒 *Katalog Produk*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb_products_paged(items, page=page),
+        )
+
+    # Buy: choose qty
     if data.startswith("buy_"):
         pid = int(data.split("_", 1)[1])
         with db() as conn:
@@ -469,15 +516,34 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not p:
             return await q.edit_message_text("Produk tidak tersedia.", reply_markup=kb_main(is_admin(u.id)))
 
-        context.user_data["pending_pid"] = pid
+        context.user_data["buy_pid"] = pid
+        context.user_data["buy_price"] = int(p["price"])
+
         return await q.edit_message_text(
-            f"Produk: *{p['name']}*\nHarga: *{rupiah(p['price'])}*\n\n"
-            "Balas chat ini dengan format:\n"
-            "`qty | catatan`\n"
-            "Contoh: `1 | ubot 1 bulan (@username)`\n\n"
-            "Atau ketik `cancel` buat batal.",
+            f"🛍 *{p['name']}*\n"
+            f"Harga satuan: *{rupiah(int(p['price']))}*\n\n"
+            "Pilih jumlah (1/2/3):",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="cat")]]),
+            reply_markup=kb_qty(),
+        )
+
+    # Qty selected -> show totals and ask note
+    if data.startswith("qty_"):
+        qty = int(data.split("_")[1])
+        price = int(context.user_data.get("buy_price", 0))
+
+        subtotal = price * qty
+        total = subtotal + ADMIN_FEE
+
+        context.user_data["pending_qty"] = qty
+
+        return await q.edit_message_text(
+            f"📦 Jumlah: *{qty}*\n"
+            f"💵 Subtotal: *{rupiah(subtotal)}*\n"
+            f"🧾 Biaya Admin: *{rupiah(ADMIN_FEE)}*\n"
+            f"💰 Total Bayar: *{rupiah(total)}*\n\n"
+            "Balas dengan catatan (opsional), atau ketik `-` jika kosong.",
+            parse_mode=ParseMode.MARKDOWN,
         )
 
     if data == "my":
@@ -539,71 +605,6 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_main(True),
         )
 
-    if data == "adm_orders":
-        if not is_admin(u.id):
-            return await q.edit_message_text("Khusus admin.", reply_markup=kb_main(False))
-        with db() as conn:
-            rows = conn.execute(
-                "SELECT o.*, p.name AS product_name FROM orders o JOIN products p ON p.id=o.product_id "
-                "ORDER BY o.id DESC LIMIT 12"
-            ).fetchall()
-        if not rows:
-            return await q.edit_message_text("Belum ada order.", reply_markup=kb_main(True))
-
-        lines = ["Order terbaru (approve/reject dari bukti bayar yang masuk ke admin):", ""]
-        for r in rows:
-            lines.append(f"• #{r['id']} @{r['username'] or r['user_id']} — {r['product_name']} x{r['qty']} — {r['status']}")
-        lines.append("")
-        lines.append("Tip: tombol approve/reject muncul di pesan bukti bayar yang bot kirim ke admin.")
-        return await q.edit_message_text("\n".join(lines), reply_markup=kb_main(True))
-
-    if data.startswith("adm_appr_") or data.startswith("adm_rej_"):
-        if not is_admin(u.id):
-            return
-        action, oid = data.rsplit("_", 1)
-        order_id = int(oid)
-
-        with db() as conn:
-            row = conn.execute(
-                "SELECT o.*, p.name AS product_name FROM orders o JOIN products p ON p.id=o.product_id WHERE o.id=?",
-                (order_id,),
-            ).fetchone()
-        if not row:
-            return await q.edit_message_text("Order tidak ditemukan.")
-
-        if action.startswith("adm_appr"):
-            new_status = "PAID"
-            admin_note = "Approved"
-            user_msg = (
-                f"✅ Pembayaran kamu *diterima*.\n"
-                f"Order *#{order_id}* sekarang *PAID*.\n"
-                "Admin bakal deliver barangnya."
-            )
-        else:
-            new_status = "REJECTED"
-            admin_note = "Rejected"
-            user_msg = (
-                f"❌ Bukti bayar *ditolak*.\n"
-                f"Order *#{order_id}* status: *REJECTED*.\n"
-                "Silakan kirim ulang bukti yang jelas."
-            )
-
-        with db() as conn:
-            conn.execute(
-                "UPDATE orders SET status=?, admin_note=?, updated_at=? WHERE id=?",
-                (new_status, admin_note, now_str(), order_id),
-            )
-
-        try:
-            await context.bot.send_message(chat_id=int(row["user_id"]), text=user_msg, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            log.exception("Failed to notify user")
-
-        return await q.edit_message_text(
-            f"OK. Order #{order_id} => {new_status}\nUser: {row['user_id']}\nProduk: {row['product_name']}",
-            reply_markup=kb_main(True),
-        )
-
     if data == "noop":
         return
 
@@ -611,31 +612,24 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MESSAGE HANDLERS
 # =========================
 async def msg_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Only used for order creation after selecting product
+    # This text handler is used for: note input after qty selection
     u = update.effective_user
     text = (update.message.text or "").strip()
 
-    if "pending_pid" in context.user_data:
-        if text.lower() == "cancel":
-            context.user_data.pop("pending_pid", None)
-            return await update.message.reply_text("Batal. Balik ke menu.", reply_markup=kb_main(is_admin(u.id)))
-
-        parts = [p.strip() for p in text.split("|", 1)]
-        if not parts[0].isdigit():
-            return await update.message.reply_text(
-                "Format salah. Contoh: `1 | ubot 1 bulan @username`",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-
-        qty = int(parts[0])
-        note = parts[1] if len(parts) > 1 else ""
-        pid = int(context.user_data.pop("pending_pid"))
+    # if user is in "note entry" stage
+    if "buy_pid" in context.user_data and "pending_qty" in context.user_data:
+        pid = int(context.user_data.pop("buy_pid"))
+        qty = int(context.user_data.pop("pending_qty"))
+        note = "" if text == "-" else text
 
         with db() as conn:
             p = conn.execute("SELECT * FROM products WHERE id=? AND active=1", (pid,)).fetchone()
             if not p:
                 return await update.message.reply_text("Produk sudah tidak tersedia.")
-            amount = int(p["price"]) * qty
+
+            subtotal = int(p["price"]) * qty
+            amount = subtotal + ADMIN_FEE  # include fee
+
             cur = conn.execute(
                 "INSERT INTO orders(user_id, username, product_id, qty, amount, note, status, created_at, updated_at) "
                 "VALUES(?,?,?,?,?,?, 'WAITING_PAYMENT', ?, ?)",
@@ -646,9 +640,11 @@ async def msg_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["await_proof_order_id"] = oid
 
         await update.message.reply_text(
-            f"Order dibuat.\n\n"
+            f"✅ Order dibuat.\n\n"
             f"Order ID: *#{oid}*\n"
             f"Produk: *{p['name']}* x{qty}\n"
+            f"Subtotal: *{rupiah(subtotal)}*\n"
+            f"Biaya Admin: *{rupiah(ADMIN_FEE)}*\n"
             f"Total: *{rupiah(amount)}*\n\n"
             + payment_instructions(amount, oid),
             parse_mode=ParseMode.MARKDOWN,
@@ -656,6 +652,9 @@ async def msg_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await send_qris(update.effective_chat.id, context)
         return
+
+    # Otherwise ignore non-command text
+    return
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -705,7 +704,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Order: *#{order_id}*\n"
         f"User: `{info['user_id']}` @{info['username'] or '-'}\n"
         f"Produk: *{info['product_name']}* x{info['qty']}\n"
-        f"Total: *{rupiah(int(info['amount']))}*\n"
+        f"Total: *{rupiah(int(info['amount']))}* (incl admin {rupiah(ADMIN_FEE)})\n"
         f"Catatan: {info['note'] or '-'}\n"
         f"Caption: {caption or '-'}\n"
         f"Status: *{info['status']}*"
@@ -722,6 +721,25 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             log.exception("Failed to send proof to admin")
+
+async def confirm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not context.args:
+        return await update.message.reply_text("Format: /confirm <order_id>  (contoh: /confirm 12)")
+
+    raw = context.args[0].strip()
+    raw = raw[1:] if raw.startswith("#") else raw
+    if not raw.isdigit():
+        return await update.message.reply_text("Order ID harus angka. Contoh: /confirm 12")
+
+    oid = int(raw)
+    with db() as conn:
+        row = conn.execute("SELECT id FROM orders WHERE id=? AND user_id=?", (oid, u.id)).fetchone()
+    if not row:
+        return await update.message.reply_text("Order tidak ditemukan (atau bukan punyamu).")
+
+    context.user_data["await_proof_order_id"] = oid
+    await update.message.reply_text(f"OK. Kirim foto bukti untuk order #{oid} sekarang.")
 
 # =========================
 # MAIN
@@ -745,7 +763,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_text_handler))
 
-    log.info("Bot running (manual payment). DB=%s", DB_PATH)
+    log.info("Bot running. DB=%s", DB_PATH)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
