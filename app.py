@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 import logging
 from datetime import datetime
@@ -38,7 +39,7 @@ for x in os.getenv("ADMIN_IDS", "").split(","):
     if x.isdigit():
         ADMIN_IDS.add(int(x))
 
-# Payment info
+# Manual payment info
 DANA_NUMBER = os.getenv("DANA_NUMBER", "").strip()
 DANA_NAME = os.getenv("DANA_NAME", "").strip()
 
@@ -46,8 +47,13 @@ BANK_NAME = os.getenv("BANK_NAME", "").strip()
 BANK_ACCOUNT = os.getenv("BANK_ACCOUNT", "").strip()
 BANK_HOLDER = os.getenv("BANK_HOLDER", "").strip()
 
+# QRIS photo (choose one)
 QRIS_FILE_ID = os.getenv("QRIS_FILE_ID", "").strip()
-QRIS_LOCAL_PATH = os.getenv("QRIS_LOCAL_PATH", "qris.jpg").strip()  # optional local file
+QRIS_LOCAL_PATH = os.getenv("QRIS_LOCAL_PATH", "qris.jpg").strip()
+
+# Testimoni channel
+TESTI_CHANNEL_ID = os.getenv("TESTI_CHANNEL_ID", "").strip()  # @username or -100xxxx
+TESTI_CONTACT = os.getenv("TESTI_CONTACT", "@Jdiginibebot").strip()
 
 # =========================
 # DB
@@ -102,6 +108,7 @@ def kb_main(admin: bool) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🛒 Katalog", callback_data="cat")],
         [InlineKeyboardButton("📦 Order Saya", callback_data="my")],
+        [InlineKeyboardButton("⭐ Testimoni", callback_data="testi_help")],
     ]
     if admin:
         rows.append([InlineKeyboardButton("⚙️ Admin: Produk", callback_data="adm_products")])
@@ -160,15 +167,7 @@ def payment_instructions(amount: int, order_id: int) -> str:
     ]
     return "\n".join(lines)
 
-async def send_qris(update_or_chat, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Tries:
-    1) sendPhoto by file_id (recommended)
-    2) sendPhoto by local file (qris.jpg)
-    If none available, skip silently.
-    """
-    chat_id = update_or_chat if isinstance(update_or_chat, int) else update_or_chat.effective_chat.id
-
+async def send_qris(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         if QRIS_FILE_ID:
             await context.bot.send_photo(chat_id=chat_id, photo=QRIS_FILE_ID, caption="QRIS (scan untuk bayar)")
@@ -179,6 +178,25 @@ async def send_qris(update_or_chat, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
     except Exception:
         log.exception("Failed to send QRIS photo")
+
+def format_testimoni_card(barang: str, harga_rp: str, kontak: str) -> str:
+    barang = (barang or "-").strip().upper()
+    harga_rp = (harga_rp or "-").strip()
+    kontak = (kontak or "-").strip()
+
+    return (
+        "╔══✦•··········•✦══╗\n"
+        "        💥  T E S T I M O N I  💥\n"
+        "╚══✦•··········•✦══╝\n\n"
+        "         TRANSAKSI BERHASIL\n\n"
+        f"🛍  BARANG : {barang}\n"
+        f"💰  HARGA  : {harga_rp}\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "✨  ALL TRANSAKSI SELESAI  ✨\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "📞  HUBUNGI KAMI\n"
+        f"➤ {kontak}"
+    )
 
 # =========================
 # COMMANDS (Admin)
@@ -253,11 +271,8 @@ async def delprod_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.execute("DELETE FROM products WHERE id=?", (pid,))
     await update.message.reply_text(f"OK. Produk #{pid} dihapus.")
 
-# Optional helper: set QRIS file_id easily
 async def setqris_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Admin can reply to a QRIS photo and run /setqris to print file_id to save in .env
-    """
+    """Reply ke foto QRIS, lalu /setqris => keluarkan QRIS_FILE_ID."""
     u = update.effective_user
     if not is_admin(u.id):
         return await update.message.reply_text("Khusus admin.")
@@ -270,12 +285,70 @@ async def setqris_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # =========================
+# COMMANDS (Testimoni auto dari order)
+# =========================
+async def testi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+
+    if not TESTI_CHANNEL_ID:
+        return await update.message.reply_text("TESTI_CHANNEL_ID belum diset di .env (atau bot belum admin channel).")
+
+    if not context.args:
+        return await update.message.reply_text("Format: /testi <order_id>  (contoh: /testi 12)")
+
+    raw = context.args[0].strip()
+    raw = raw[1:] if raw.startswith("#") else raw
+    if not raw.isdigit():
+        return await update.message.reply_text("Order ID harus angka. Contoh: /testi 12")
+
+    oid = int(raw)
+
+    with db() as conn:
+        row = conn.execute(
+            "SELECT o.*, p.name AS product_name "
+            "FROM orders o JOIN products p ON p.id=o.product_id "
+            "WHERE o.id=?",
+            (oid,),
+        ).fetchone()
+
+    if not row:
+        return await update.message.reply_text("Order tidak ditemukan.")
+
+    # User biasa: hanya order sendiri + status PAID/DONE
+    if not is_admin(u.id):
+        if int(row["user_id"]) != u.id:
+            return await update.message.reply_text("Itu bukan order kamu.")
+        if row["status"] not in ("PAID", "DONE"):
+            return await update.message.reply_text(
+                f"Order #{oid} statusnya masih *{row['status']}*.\n"
+                "Testimoni hanya bisa kalau sudah PAID/DONE.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+    caption = format_testimoni_card(
+        barang=row["product_name"],
+        harga_rp=rupiah(int(row["amount"])),
+        kontak=TESTI_CONTACT,
+    )
+
+    try:
+        await context.bot.send_message(chat_id=TESTI_CHANNEL_ID, text=caption)
+    except Exception as e:
+        log.exception("Failed to post testi to channel")
+        return await update.message.reply_text(f"Gagal upload ke channel: {e}")
+
+    await update.message.reply_text(
+        f"Berhasil. Testimoni order *#{oid}* sudah di-upload ke channel.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+# =========================
 # USER FLOWS
 # =========================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     await update.message.reply_text(
-        "Auto Order aktif.\nPilih produk di Katalog, bayar manual, kirim bukti. Beres.",
+        "Auto Order aktif.\nPilih produk, bayar manual (DANA/Bank/QRIS), kirim bukti. Beres.",
         reply_markup=kb_main(is_admin(u.id)),
     )
 
@@ -325,8 +398,24 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         lines = []
         for r in rows:
-            lines.append(f"• #{r['id']} {r['product_name']} x{r['qty']} — *{r['status']}* — {rupiah(r['amount'])}")
+            lines.append(
+                f"• #{r['id']} {r['product_name']} x{r['qty']} — *{r['status']}* — {rupiah(r['amount'])}"
+            )
+        lines.append("")
+        lines.append("Buat testimoni: /testi <order_id>  (contoh: /testi 12)")
         return await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_main(is_admin(u.id)))
+
+    if data == "testi_help":
+        msg = (
+            "⭐ *Testimoni*\n\n"
+            "Format:\n"
+            "`/testi <order_id>`\n"
+            "Contoh: `/testi 12`\n\n"
+            "Syarat:\n"
+            "• Order kamu harus status *PAID* atau *DONE*.\n"
+            "• Nanti bot auto upload ke channel testimoni."
+        )
+        return await q.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_main(is_admin(u.id)))
 
     if data == "adm_products":
         if not is_admin(u.id):
@@ -356,12 +445,11 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rows:
             return await q.edit_message_text("Belum ada order.", reply_markup=kb_main(True))
 
-        lines = ["Order terbaru (klik approve/reject dari bukti yang masuk):"]
-        lines.append("")
+        lines = ["Order terbaru (approve/reject dari bukti bayar yang masuk ke admin):", ""]
         for r in rows:
             lines.append(f"• #{r['id']} @{r['username'] or r['user_id']} — {r['product_name']} x{r['qty']} — {r['status']}")
         lines.append("")
-        lines.append("Tip: approve/reject paling enak dari pesan bukti bayar yang bot forward ke admin.")
+        lines.append("Tip: tombol approve/reject muncul di pesan bukti bayar yang bot kirim ke admin.")
         return await q.edit_message_text("\n".join(lines), reply_markup=kb_main(True))
 
     if data.startswith("adm_appr_") or data.startswith("adm_rej_"):
@@ -384,7 +472,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_msg = (
                 f"✅ Pembayaran kamu *diterima*.\n"
                 f"Order *#{order_id}* sekarang *PAID*.\n"
-                "Admin bakal deliver barangnya. Tenang, ini bukan ghosting."
+                "Admin bakal deliver barangnya."
             )
         else:
             new_status = "REJECTED"
@@ -392,7 +480,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_msg = (
                 f"❌ Bukti bayar *ditolak*.\n"
                 f"Order *#{order_id}* status: *REJECTED*.\n"
-                "Silakan kirim ulang bukti yang jelas (atau chat admin)."
+                "Silakan kirim ulang bukti yang jelas."
             )
 
         with db() as conn:
@@ -401,7 +489,6 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 (new_status, admin_note, now_str(), order_id),
             )
 
-        # notify user
         try:
             await context.bot.send_message(chat_id=int(row["user_id"]), text=user_msg, parse_mode=ParseMode.MARKDOWN)
         except Exception:
@@ -419,12 +506,12 @@ async def msg_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     text = (update.message.text or "").strip()
 
-    # bind proof target quickly: /confirm 12
+    # Quick bind: /confirm 12 (so next photo attaches to order)
     if text.lower().startswith("/confirm"):
         parts = text.split()
-        if len(parts) < 2 or not parts[1].isdigit():
-            return await update.message.reply_text("Format: /confirm <order_id>")
-        oid = int(parts[1])
+        if len(parts) < 2 or not parts[1].lstrip("#").isdigit():
+            return await update.message.reply_text("Format: /confirm <order_id>  (contoh: /confirm 12)")
+        oid = int(parts[1].lstrip("#"))
         with db() as conn:
             row = conn.execute("SELECT id FROM orders WHERE id=? AND user_id=?", (oid, u.id)).fetchone()
         if not row:
@@ -432,7 +519,7 @@ async def msg_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["await_proof_order_id"] = oid
         return await update.message.reply_text(f"OK. Kirim foto bukti untuk order #{oid} sekarang.")
 
-    # create order after selecting product
+    # Create order after selecting product
     if "pending_pid" in context.user_data:
         if text.lower() == "cancel":
             context.user_data.pop("pending_pid", None)
@@ -458,7 +545,7 @@ async def msg_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             oid = cur.lastrowid
 
-        # set awaiting proof
+        # next photo attaches to this order by default
         context.user_data["await_proof_order_id"] = oid
 
         await update.message.reply_text(
@@ -471,8 +558,7 @@ async def msg_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_main(is_admin(u.id)),
         )
 
-        # send QRIS photo (if available)
-        await send_qris(update, context)
+        await send_qris(update.effective_chat.id, context)
         return
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -483,14 +569,13 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_id = update.message.photo[-1].file_id
     caption = (update.message.caption or "").strip()
 
-    # Determine order id: prefer caption "#12", else user_data awaiting
+    # Determine order id: caption "#12" preferred, else awaiting_proof_order_id
     order_id: Optional[int] = None
-    m = None
     if caption:
-        m = __import__("re").search(r"#(\d+)", caption)
-    if m:
-        order_id = int(m.group(1))
-    else:
+        m = re.search(r"#(\d+)", caption)
+        if m:
+            order_id = int(m.group(1))
+    if not order_id:
         order_id = context.user_data.get("await_proof_order_id")
 
     if not order_id:
@@ -503,20 +588,18 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row = conn.execute("SELECT * FROM orders WHERE id=? AND user_id=?", (order_id, u.id)).fetchone()
         if not row:
             return await update.message.reply_text("Order tidak ditemukan (atau bukan punyamu).")
-        # save proof
+
         conn.execute(
             "UPDATE orders SET proof_file_id=?, proof_caption=?, status='PROOF_SUBMITTED', updated_at=? WHERE id=?",
             (file_id, caption, now_str(), order_id),
         )
 
-    # notify user
     await update.message.reply_text(
-        f"OK. Bukti untuk order *#{order_id}* sudah masuk.\n"
-        "Tunggu admin verifikasi.",
+        f"OK. Bukti untuk order *#{order_id}* sudah masuk.\nTunggu admin verifikasi.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # forward proof to admins with action buttons
+    # Send proof to admins with approve/reject buttons
     with db() as conn:
         info = conn.execute(
             "SELECT o.*, p.name AS product_name FROM orders o JOIN products p ON p.id=o.product_id WHERE o.id=?",
@@ -554,9 +637,11 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # user commands
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("testi", testi_cmd))
 
-    # admin product management
+    # admin commands
     app.add_handler(CommandHandler("addprod", addprod_cmd))
     app.add_handler(CommandHandler("setprod", setprod_cmd))
     app.add_handler(CommandHandler("delprod", delprod_cmd))
